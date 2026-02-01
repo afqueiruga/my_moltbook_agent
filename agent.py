@@ -872,9 +872,7 @@ def build_comment_reply_prompt(
     own_post: Dict[str, Any],
     comment: Dict[str, Any],
     mode: dict,
-    state: Dict[str, Any],
-    *,
-    ollama_base: str
+    state: Dict[str, Any]
 ) -> str:
     """Build prompt for replying to a comment on the agent's own post."""
     own_post = normalize_post_item(own_post)
