@@ -42,6 +42,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_result,
+    RetryCallState,
+)
 
 # ----------------------------
 # Config
@@ -376,21 +383,66 @@ def request_json(
     return r.status_code, data
 
 
-def is_retryable_status(status: int) -> bool:
-    # 429: rate limit; 5xx: transient server issues; 599: synthetic network failure
-    return status in {429, 500, 502, 503, 504, 599}
-
-
 def sleep_with_jitter(seconds: float) -> None:
     time.sleep(seconds + random.uniform(0, 2.0))
 
 
-def backoff_sleep(attempt: int, retry_after: Optional[float] = None) -> None:
-    if retry_after is not None and retry_after > 0:
-        sleep_with_jitter(min(retry_after, BACKOFF_MAX_SECONDS))
-        return
+# ----------------------------
+# Tenacity retry helpers
+# ----------------------------
+
+def _is_retryable_result(result: Tuple[int, Dict[str, Any]]) -> bool:
+    """Check if response status warrants a retry."""
+    status, _ = result
+    return status in {429, 500, 502, 503, 504, 599}
+
+
+def _wait_with_retry_after(retry_state: RetryCallState) -> float:
+    """
+    Custom wait function that respects retry_after hints from API responses.
+    Falls back to exponential backoff if no hint is present.
+    """
+    if retry_state.outcome and not retry_state.outcome.failed:
+        status, data = retry_state.outcome.result()
+        if status == 429:
+            # Check for retry_after hints in response body
+            for key, multiplier in [("retry_after_seconds", 1), ("retry_after_minutes", 60)]:
+                val = data.get(key)
+                if val is not None:
+                    try:
+                        wait_time = float(val) * multiplier
+                        return min(wait_time, BACKOFF_MAX_SECONDS) + random.uniform(0, 2.0)
+                    except (ValueError, TypeError):
+                        pass
+
+    # Exponential backoff fallback
+    attempt = retry_state.attempt_number
     delay = min(BACKOFF_BASE_SECONDS * (2 ** attempt), BACKOFF_MAX_SECONDS)
-    sleep_with_jitter(delay)
+    return delay + random.uniform(0, 2.0)
+
+
+def _log_retry_attempt(retry_state: RetryCallState) -> None:
+    """Log information about retry attempts for observability."""
+    if retry_state.outcome and not retry_state.outcome.failed:
+        status, data = retry_state.outcome.result()
+        attempt = retry_state.attempt_number
+        if status == 429:
+            remaining = data.get("daily_remaining")
+            msg = f"[rate-limit] attempt {attempt}/{MAX_RETRIES}"
+            if remaining is not None:
+                msg += f", daily_remaining={remaining}"
+            print(msg)
+        elif status >= 500:
+            print(f"[retry] server error {status}, attempt {attempt}/{MAX_RETRIES}")
+
+
+# Reusable retry decorator for Moltbook API calls
+moltbook_retry = retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=_wait_with_retry_after,
+    retry=retry_if_result(_is_retryable_result),
+    before_sleep=_log_retry_attempt,
+)
 
 
 # ----------------------------
@@ -410,6 +462,11 @@ def ensure_safe_ollama_host(ollama_base: str, allow_remote: bool) -> str:
     return ollama_base
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, max=30),
+    before_sleep=lambda rs: print(f"[ollama] retry attempt {rs.attempt_number}/3"),
+)
 def ollama_generate(prompt: str, *, ollama_base: str) -> str:
     payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
     r = requests.post(f"{ollama_base}/api/generate", json=payload, timeout=180)
@@ -442,46 +499,35 @@ def get_claim_status(api_key: str) -> str:
 
 
 def get_personal_feed(api_key: str, sort: str = "new", limit: int = 10) -> Dict[str, Any]:
-    for attempt in range(MAX_RETRIES):
-        status, data = request_json(
+    @moltbook_retry
+    def _fetch() -> Tuple[int, Dict[str, Any]]:
+        return request_json(
             "GET",
             f"{API_BASE}/feed",
             headers=auth_headers(api_key),
             params={"sort": sort, "limit": limit},
         )
-        if status == 429:
-            backoff_sleep(attempt, retry_after=10)
-            continue
-        if is_retryable_status(status):
-            backoff_sleep(attempt)
-            continue
-        if status >= 400:
-            raise RuntimeError(f"Feed failed ({status}): {data}")
-        return data
-    raise RuntimeError("Feed failed: too many rate-limit retries")
+
+    status, data = _fetch()
+    if status >= 400:
+        raise RuntimeError(f"Feed failed ({status}): {data}")
+    return data
 
 
 def create_post(api_key: str, submolt: str, title: str, content: str) -> Dict[str, Any]:
-    for attempt in range(MAX_RETRIES):
-        status, data = request_json(
+    @moltbook_retry
+    def _post() -> Tuple[int, Dict[str, Any]]:
+        return request_json(
             "POST",
             f"{API_BASE}/posts",
             headers=auth_headers(api_key),
             json_body={"submolt": submolt, "title": title, "content": content},
         )
-        if status == 429:
-            retry_min = data.get("retry_after_minutes")
-            retry_s = float(retry_min) * 60 if retry_min is not None else None
-            print(f"[rate-limit] post cooldown; retry_after_minutes={retry_min}")
-            backoff_sleep(attempt, retry_after=retry_s)
-            continue
-        if is_retryable_status(status):
-            backoff_sleep(attempt)
-            continue
-        if status >= 400:
-            raise RuntimeError(f"Create post failed ({status}): {data}")
-        return data
-    raise RuntimeError("Create post failed: too many rate-limit retries")
+
+    status, data = _post()
+    if status >= 400:
+        raise RuntimeError(f"Create post failed ({status}): {data}")
+    return data
 
 
 def comment_on_post(api_key: str, post_id: str, content: str, parent_id: Optional[str] = None) -> Dict[str, Any]:
@@ -489,26 +535,19 @@ def comment_on_post(api_key: str, post_id: str, content: str, parent_id: Optiona
     if parent_id:
         body["parent_id"] = parent_id
 
-    for attempt in range(MAX_RETRIES):
-        status, data = request_json(
+    @moltbook_retry
+    def _comment() -> Tuple[int, Dict[str, Any]]:
+        return request_json(
             "POST",
             f"{API_BASE}/posts/{post_id}/comments",
             headers=auth_headers(api_key),
             json_body=body,
         )
-        if status == 429:
-            retry_s = data.get("retry_after_seconds")
-            remaining = data.get("daily_remaining")
-            print(f"[rate-limit] comment cooldown; retry_after_seconds={retry_s}, daily_remaining={remaining}")
-            backoff_sleep(attempt, retry_after=float(retry_s) if retry_s is not None else None)
-            continue
-        if is_retryable_status(status):
-            backoff_sleep(attempt)
-            continue
-        if status >= 400:
-            raise RuntimeError(f"Comment failed ({status}): {data}")
-        return data
-    raise RuntimeError("Comment failed: too many rate-limit retries")
+
+    status, data = _comment()
+    if status >= 400:
+        raise RuntimeError(f"Comment failed ({status}): {data}")
+    return data
 
 
 # ----------------------------
