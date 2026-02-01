@@ -436,13 +436,42 @@ def _log_retry_attempt(retry_state: RetryCallState) -> None:
             print(f"[retry] server error {status}, attempt {attempt}/{MAX_RETRIES}")
 
 
-# Reusable retry decorator for Moltbook API calls
-moltbook_retry = retry(
+@retry(
     stop=stop_after_attempt(MAX_RETRIES),
     wait=_wait_with_retry_after,
     retry=retry_if_result(_is_retryable_result),
     before_sleep=_log_retry_attempt,
 )
+def _request_with_retry(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+) -> Tuple[int, Dict[str, Any]]:
+    """Low-level request with retry. Returns (status, data)."""
+    return request_json(method, url, headers=headers, json_body=json_body, params=params, timeout=timeout)
+
+
+def moltbook_request(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+    operation: str = "Request",
+) -> Dict[str, Any]:
+    """Make a Moltbook API request with retry. Raises RuntimeError on failure."""
+    status, data = _request_with_retry(
+        method, url, headers=headers, json_body=json_body, params=params, timeout=timeout
+    )
+    if status >= 400:
+        raise RuntimeError(f"{operation} failed ({status}): {data}")
+    return data
 
 
 # ----------------------------
@@ -499,55 +528,33 @@ def get_claim_status(api_key: str) -> str:
 
 
 def get_personal_feed(api_key: str, sort: str = "new", limit: int = 10) -> Dict[str, Any]:
-    @moltbook_retry
-    def _fetch() -> Tuple[int, Dict[str, Any]]:
-        return request_json(
-            "GET",
-            f"{API_BASE}/feed",
-            headers=auth_headers(api_key),
-            params={"sort": sort, "limit": limit},
-        )
-
-    status, data = _fetch()
-    if status >= 400:
-        raise RuntimeError(f"Feed failed ({status}): {data}")
-    return data
+    return moltbook_request(
+        "GET", f"{API_BASE}/feed",
+        headers=auth_headers(api_key),
+        params={"sort": sort, "limit": limit},
+        operation="Feed",
+    )
 
 
 def create_post(api_key: str, submolt: str, title: str, content: str) -> Dict[str, Any]:
-    @moltbook_retry
-    def _post() -> Tuple[int, Dict[str, Any]]:
-        return request_json(
-            "POST",
-            f"{API_BASE}/posts",
-            headers=auth_headers(api_key),
-            json_body={"submolt": submolt, "title": title, "content": content},
-        )
-
-    status, data = _post()
-    if status >= 400:
-        raise RuntimeError(f"Create post failed ({status}): {data}")
-    return data
+    return moltbook_request(
+        "POST", f"{API_BASE}/posts",
+        headers=auth_headers(api_key),
+        json_body={"submolt": submolt, "title": title, "content": content},
+        operation="Create post",
+    )
 
 
 def comment_on_post(api_key: str, post_id: str, content: str, parent_id: Optional[str] = None) -> Dict[str, Any]:
     body: Dict[str, Any] = {"content": content}
     if parent_id:
         body["parent_id"] = parent_id
-
-    @moltbook_retry
-    def _comment() -> Tuple[int, Dict[str, Any]]:
-        return request_json(
-            "POST",
-            f"{API_BASE}/posts/{post_id}/comments",
-            headers=auth_headers(api_key),
-            json_body=body,
-        )
-
-    status, data = _comment()
-    if status >= 400:
-        raise RuntimeError(f"Comment failed ({status}): {data}")
-    return data
+    return moltbook_request(
+        "POST", f"{API_BASE}/posts/{post_id}/comments",
+        headers=auth_headers(api_key),
+        json_body=body,
+        operation="Comment",
+    )
 
 
 # ----------------------------
