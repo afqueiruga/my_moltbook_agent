@@ -211,7 +211,13 @@ def load_creds() -> Optional[Credentials]:
         return None
     data = load_json(CREDENTIALS_PATH, {})
     if "api_key" in data and "agent_name" in data:
-        return Credentials(api_key=str(data["api_key"]), agent_name=str(data["agent_name"]))
+        api_key = str(data["api_key"]).strip()
+        agent_name = str(data["agent_name"]).strip()
+        if not api_key:
+            raise RuntimeError(f"API key is empty in {CREDENTIALS_PATH}")
+        if not api_key.startswith("moltbook_"):
+            print(f"[warning] API key does not start with 'moltbook_' - may be invalid")
+        return Credentials(api_key=api_key, agent_name=agent_name)
     raise RuntimeError(f"Credentials file missing fields: {CREDENTIALS_PATH}")
 
 
@@ -374,6 +380,9 @@ def request_json(
             timeout=timeout,
             allow_redirects=False,
         )
+        # Debug: check if we got redirected (301/302/307/308)
+        if r.status_code in (301, 302, 307, 308):
+            print(f"[debug] REDIRECT detected: {r.status_code} -> {r.headers.get('Location', 'unknown')}")
     except requests.RequestException as e:
         # 599 is a common convention for "network connect timeout error"/synthetic status.
         return 599, {"success": False, "error": f"Request failed: {e.__class__.__name__}: {e}"}
@@ -523,18 +532,22 @@ def register_agent(name: str, description: str) -> Dict[str, Any]:
 
 def get_claim_status(api_key: str) -> str:
     status, data = request_json("GET", f"{API_BASE}/agents/status", headers=auth_headers(api_key))
+    print(f"[debug] status check: HTTP {status}, data={data}")
     if status >= 400:
         raise RuntimeError(f"Status failed ({status}): {data}")
     return str(data.get("status", "unknown"))
 
 
 def get_personal_feed(api_key: str, sort: str = "new", limit: int = 10) -> Dict[str, Any]:
-    return moltbook_request(
+    print(f"[debug] fetching feed...")
+    result = moltbook_request(
         "GET", f"{API_BASE}/feed",
         headers=auth_headers(api_key),
         params={"sort": sort, "limit": limit},
         operation="Feed",
     )
+    print(f"[debug] feed returned {len(result.get('posts', result.get('items', [])))} items")
+    return result
 
 
 def create_post(api_key: str, submolt: str, title: str, content: str) -> Dict[str, Any]:
@@ -550,9 +563,13 @@ def comment_on_post(api_key: str, post_id: str, content: str, parent_id: Optiona
     body: Dict[str, Any] = {"content": content}
     if parent_id:
         body["parent_id"] = parent_id
+    url = f"{API_BASE}/posts/{post_id}/comments"
+    hdrs = auth_headers(api_key)
+    print(f"[debug] POST {url}")
+    print(f"[debug] headers: Authorization={hdrs.get('Authorization', 'MISSING')[:25]}...")
     return moltbook_request(
-        "POST", f"{API_BASE}/posts/{post_id}/comments",
-        headers=auth_headers(api_key),
+        "POST", url,
+        headers=hdrs,
         json_body=body,
         operation="Comment",
     )
@@ -909,8 +926,12 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
         post = pick_post_to_reply(feed, state)
 
         if action == "comment_one":
-            if post:
+            # TODO: Comments disabled due to Moltbook API bug - 401 on /posts/{id}/comments
+            # even though posting works fine with the same API key. Re-enable when fixed.
+            print("[moltbook] commenting temporarily disabled (API bug - see https://moltbook.com)")
+            if False and post:  # Disabled
                 post_id = extract_post_id(post) or "unknown"
+                print(f"[debug] selected post for comment: id={post_id}, keys={list(post.keys())}")
                 if post_id != "unknown" and already_replied(state, post_id):
                     print("[moltbook] already replied; skipping comment.")
                 else:
@@ -936,6 +957,9 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
                                 save_state(state)
                             except Exception as e:
                                 print(f"[moltbook] comment error: {e}")
+                                if "401" in str(e) or "Authentication" in str(e):
+                                    print("[moltbook] hint: 401 errors usually mean your agent isn't claimed yet,")
+                                    print("         or the API key is invalid. Try re-registering or check claim status.")
             else:
                 print("[moltbook] feed empty / all seen; nothing to comment on.")
 
