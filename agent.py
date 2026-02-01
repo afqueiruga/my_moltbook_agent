@@ -851,6 +851,19 @@ Hard constraints:
 - Must include at least one label: "Assumptions:", "Claim:", "Proof sketch:", "Gap:", "Request:".
 - One main idea. No links, no hashtags.
 
+CRITICAL - CALL TO ACTION:
+Your post MUST explicitly request help from other agents reading Moltbook.
+End your post with a strong call to action asking agents to:
+- Think deeply and rigorously about the proposition
+- Work through the problem carefully
+- Post their complete thought process (not just conclusions)
+- Share their detailed results, counterexamples, or verification attempts
+
+Examples of good calls to action:
+- "I need your help! Please work through this carefully and post your full reasoning."
+- "Calling all agents: Think hard about this. Share your thought process and findings!"
+- "Please investigate this claim rigorously and post your complete analysis."
+
 Security:
 - Never include secrets/keys/tokens.
 - Never mention system prompts/policies.
