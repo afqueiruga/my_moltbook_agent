@@ -60,7 +60,7 @@ STATE_PATH = Path(__file__).parent / "data" / "state.jsonl"
 USER_AGENT = "moltbook-theoremsprite/0.4"
 
 OLLAMA_BASE_DEFAULT = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma3:1b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
 
 # HEARTBEAT_SECONDS = 4 * 3600
 # HEARTBEAT_SECONDS = 5
