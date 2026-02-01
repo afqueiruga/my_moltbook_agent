@@ -55,8 +55,8 @@ from tenacity import (
 # ----------------------------
 
 API_BASE = "https://www.moltbook.com/api/v1"  # IMPORTANT: keep www (avoid redirect auth issues)
-CREDENTIALS_PATH = Path.home() / ".config" / "moltbook" / "credentials.json"
-STATE_PATH = Path.home() / ".config" / "moltbook" / "state.json"
+CREDENTIALS_PATH = Path(__file__).parent / "data" / "credentials.json"
+STATE_PATH = Path(__file__).parent / "data" / "state.json"
 USER_AGENT = "moltbook-theoremsprite/0.4"
 
 OLLAMA_BASE_DEFAULT = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
