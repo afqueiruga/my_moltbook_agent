@@ -60,9 +60,10 @@ STATE_PATH = Path(__file__).parent / "data" / "state.json"
 USER_AGENT = "moltbook-theoremsprite/0.4"
 
 OLLAMA_BASE_DEFAULT = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma3:1b")
 
-HEARTBEAT_SECONDS = 4 * 3600
+# HEARTBEAT_SECONDS = 4 * 3600
+HEARTBEAT_SECONDS = 5
 
 # Content caps (defensive)
 MAX_TITLE_CHARS = 60
@@ -612,6 +613,37 @@ def pick_post_to_reply(feed_data: Any, state: Dict[str, Any]) -> Optional[Dict[s
 # Topic synthesis (evolving, not fixed)
 # ----------------------------
 
+def _extract_json_from_llm(raw: str) -> Any:
+    """Extract JSON from LLM response, handling empty strings and markdown code blocks."""
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty response from LLM")
+
+    # Try to extract from markdown code blocks: ```json ... ``` or ``` ... ```
+    code_block_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if code_block_match:
+        text = code_block_match.group(1).strip()
+
+    # If still empty after extraction
+    if not text:
+        raise ValueError("empty JSON content after code block extraction")
+
+    # Try to find JSON array or object in the text
+    # Look for first [ or { and last ] or }
+    arr_start = text.find("[")
+    obj_start = text.find("{")
+    if arr_start >= 0 and (obj_start < 0 or arr_start < obj_start):
+        arr_end = text.rfind("]")
+        if arr_end > arr_start:
+            text = text[arr_start : arr_end + 1]
+    elif obj_start >= 0:
+        obj_end = text.rfind("}")
+        if obj_end > obj_start:
+            text = text[obj_start : obj_end + 1]
+
+    return json.loads(text)
+
+
 def _clamp_topic_seed(seed: str) -> str:
     s = (seed or "").strip().replace("\n", " ")
     s = re.sub(r"\s+", " ", s)
@@ -651,7 +683,7 @@ Return STRICT JSON as a list of strings:
 
     try:
         raw = ollama_generate(prompt, ollama_base=ollama_base)
-        ideas = json.loads(raw)
+        ideas = _extract_json_from_llm(raw)
         if isinstance(ideas, list):
             cleaned: List[str] = []
             for x in ideas:
@@ -913,7 +945,7 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
                 raw = ollama_generate(prompt, ollama_base=ollama_base)
 
                 try:
-                    payload = json.loads(raw)
+                    payload = _extract_json_from_llm(raw)
                     title = clamp_title(str(payload.get("title", "")))
                     content = clamp_text(str(payload.get("content", "")), MAX_POST_CHARS)
 
