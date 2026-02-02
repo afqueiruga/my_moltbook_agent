@@ -1239,10 +1239,7 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
         post = pick_post_to_reply(feed, state)
 
         if action == "comment_one":
-            # TODO: Comments disabled due to Moltbook API bug - 401 on /posts/{id}/comments
-            # even though posting works fine with the same API key. Re-enable when fixed.
-            print("[moltbook] commenting temporarily disabled (API bug - see https://moltbook.com)")
-            if False and post:  # Disabled
+            if post:
                 post_id = extract_post_id(post) or "unknown"
                 print(f"[debug] selected post for comment: id={post_id}, keys={list(post.keys())}")
                 if post_id != "unknown" and already_replied(state, post_id):
