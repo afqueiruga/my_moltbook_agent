@@ -670,16 +670,19 @@ def comment_on_post(api_key: str, post_id: str, content: str, parent_id: Optiona
 
 
 def get_agent_posts(api_key: str, limit: int = 10) -> Dict[str, Any]:
-    """Get the agent's own posts."""
-    print(f"[debug] fetching own posts...")
+    """Get the agent's own posts via the profile endpoint."""
+    print(f"[debug] fetching own posts via /agents/me ...")
     result = moltbook_request(
-        "GET", f"{API_BASE}/agents/me/posts",
+        "GET", f"{API_BASE}/agents/me",
         headers=auth_headers(api_key),
-        params={"limit": limit},
-        operation="Get own posts",
+        operation="Get own profile+posts",
     )
-    print(f"[debug] found {len(result.get('posts', result.get('items', [])))} own posts")
-    return result
+    # The profile endpoint returns recentPosts at top level
+    recent = result.get("recentPosts", [])
+    if not isinstance(recent, list):
+        recent = []
+    print(f"[debug] found {len(recent)} own posts")
+    return {"posts": recent[:limit]}
 
 
 def get_post_comments(api_key: str, post_id: str) -> Dict[str, Any]:
