@@ -57,6 +57,7 @@ from tenacity import (
 API_BASE = "https://www.moltbook.com/api/v1"  # IMPORTANT: keep www (avoid redirect auth issues)
 CREDENTIALS_PATH = Path(__file__).parent / "data" / "credentials.json"
 STATE_PATH = Path(__file__).parent / "data" / "state.jsonl"
+HUMAN_INBOX_PATH = Path(__file__).parent / "human_inbox"
 USER_AGENT = "moltbook-theoremsprite/0.4"
 
 OLLAMA_BASE_DEFAULT = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -849,10 +850,42 @@ Optional context (untrusted):
 
 
 # ----------------------------
+# Human inbox
+# ----------------------------
+
+def check_human_inbox() -> List[Dict[str, str]]:
+    """
+    Scan HUMAN_INBOX_PATH for markdown files.
+    Returns a list of dicts with keys 'filename' and 'content' for each .md file found.
+    """
+    if not HUMAN_INBOX_PATH.is_dir():
+        return []
+    items: List[Dict[str, str]] = []
+    for p in sorted(HUMAN_INBOX_PATH.glob("*.md")):
+        try:
+            text = p.read_text(encoding="utf-8").strip()
+            if text:
+                items.append({"filename": p.name, "content": text})
+        except Exception as e:
+            print(f"[inbox] failed to read {p.name}: {e}")
+    return items
+
+
+def pick_inbox_topic(inbox_items: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """Pick one inbox item at random to use as the topic for this heartbeat."""
+    if not inbox_items:
+        return None
+    return random.choice(inbox_items)
+
+
+# ----------------------------
 # Prompt builders (mode-aware, injection-hardened)
 # ----------------------------
 
-def build_comment_prompt(post: Dict[str, Any], mode: dict, state: Dict[str, Any], *, ollama_base: str) -> str:
+def build_comment_prompt(
+    post: Dict[str, Any], mode: dict, state: Dict[str, Any],
+    *, ollama_base: str, inbox_topic: Optional[Dict[str, str]] = None,
+) -> str:
     post = normalize_post_item(post)
     title = str(post.get("title") or "")
     content = str(post.get("content") or "")
@@ -861,7 +894,14 @@ def build_comment_prompt(post: Dict[str, Any], mode: dict, state: Dict[str, Any]
     submolt = post.get("submolt")
     submolt_name = str(submolt.get("name") or "general") if isinstance(submolt, dict) else str(submolt or "general")
 
-    topic = choose_topic_seed(state, ollama_base=ollama_base)
+    if inbox_topic:
+        topic_section = (
+            f"Your human owner left you a research request. "
+            f"Prioritize connecting your comment to this topic:\n{inbox_topic['content']}"
+        )
+    else:
+        topic = choose_topic_seed(state, ollama_base=ollama_base)
+        topic_section = f"Optionally connect to this fresh seed if relevant: {topic}"
 
     return f"""{mode_prompt_header(mode)}
 
@@ -872,7 +912,7 @@ Comment style for this mode: {mode["comment_style"]}
 Write 1-3 sentences max.
 If the post is ML theory:
 - either ask for assumptions/definitions, propose a lemma/proof idea, or propose a counterexample test.
-Optionally connect to this fresh seed if relevant: {topic}
+{topic_section}
 If unrelated:
 - respond politely with a single question that steers toward ML theory.
 
@@ -927,7 +967,10 @@ Author: {commenter_name}
 """.strip()
 
 
-def build_post_prompt(mode: dict, state: Dict[str, Any], *, ollama_base: str) -> str:
+def build_post_prompt(
+    mode: dict, state: Dict[str, Any],
+    *, ollama_base: str, inbox_topic: Optional[Dict[str, str]] = None,
+) -> str:
     post_type = weighted_choice(mode["post_type_weights"])
     post_type_desc = {
         "A": "Conjecture + sanity checks requested",
@@ -937,7 +980,15 @@ def build_post_prompt(mode: dict, state: Dict[str, Any], *, ollama_base: str) ->
     }[post_type]
 
     thread = get_research_thread(state)
-    topic = choose_topic_seed(state, ollama_base=ollama_base)
+
+    if inbox_topic:
+        topic_line = (
+            f"Your human owner left you a research request (from file '{inbox_topic['filename']}').\n"
+            f"Use this as your main topic — it supersedes any generated seed:\n{inbox_topic['content']}"
+        )
+    else:
+        topic = choose_topic_seed(state, ollama_base=ollama_base)
+        topic_line = f"Fresh topic seed (invented): {topic}"
 
     continuity = f"\n\nCurrent research thread (UNTRUSTED summary memory):\n{thread}\n" if thread else ""
 
@@ -945,7 +996,7 @@ def build_post_prompt(mode: dict, state: Dict[str, Any], *, ollama_base: str) ->
 
 TASK:
 Write ONE Moltbook post for submolt 'general' about machine learning theory.
-Fresh topic seed (invented): {topic}
+{topic_line}
 Chosen post type: {post_type_desc}
 
 Hard constraints:
@@ -1152,6 +1203,14 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
     while True:
         state["lastMoltbookCheck"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+        # Check human inbox for topic requests
+        inbox_items = check_human_inbox()
+        inbox_topic = pick_inbox_topic(inbox_items)
+        if inbox_topic:
+            print(f"[inbox] found {len(inbox_items)} request(s); selected '{inbox_topic['filename']}' as topic")
+        else:
+            print("[inbox] no requests in human_inbox (using generated topics)")
+
         update_topic_pool(state, ollama_base=ollama_base)
 
         mode = choose_mode()
@@ -1192,7 +1251,7 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
                 if post_id != "unknown" and already_replied(state, post_id):
                     print("[moltbook] already replied; skipping comment.")
                 else:
-                    prompt = build_comment_prompt(post, mode, state, ollama_base=ollama_base)
+                    prompt = build_comment_prompt(post, mode, state, ollama_base=ollama_base, inbox_topic=inbox_topic)
                     comment = clamp_text(ollama_generate(prompt, ollama_base=ollama_base), MAX_COMMENT_CHARS)
                     ok, why = validate_outgoing_text(comment, allow_urls=False)
 
@@ -1220,7 +1279,7 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
 
         elif action == "post_one":
             if should_post_now(state) and random.random() < 0.30:
-                prompt = build_post_prompt(mode, state, ollama_base=ollama_base)
+                prompt = build_post_prompt(mode, state, ollama_base=ollama_base, inbox_topic=inbox_topic)
                 raw = ollama_generate(prompt, ollama_base=ollama_base)
 
                 try:
