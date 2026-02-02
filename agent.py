@@ -853,6 +853,21 @@ Optional context (untrusted):
 # Human inbox + unified topic selection
 # ----------------------------
 
+def check_human_inbox() -> List[Dict[str, str]]:
+    """Return list of {'filename', 'content'} for each .md file in human_inbox/."""
+    if not HUMAN_INBOX_PATH.is_dir():
+        return []
+    items: List[Dict[str, str]] = []
+    for p in sorted(HUMAN_INBOX_PATH.glob("*.md")):
+        try:
+            text = p.read_text(encoding="utf-8").strip()
+            if text:
+                items.append({"filename": p.name, "content": text})
+        except Exception as e:
+            print(f"[inbox] failed to read {p.name}: {e}")
+    return items
+
+
 def select_topic(
     state: Dict[str, Any],
     *,
@@ -861,21 +876,10 @@ def select_topic(
 ) -> str:
     """
     Return a topic directive string for use in prompts.
-    Checks human_inbox/ for markdown files first; if any exist, one is
-    chosen at random and supersedes the built-in topic pool.
-    context should be 'post' or 'comment' to adjust phrasing.
+    Checks human_inbox/ first; if any requests exist, one is chosen at random
+    and supersedes the built-in topic pool.
     """
-    # Check human inbox
-    inbox_items: List[Dict[str, str]] = []
-    if HUMAN_INBOX_PATH.is_dir():
-        for p in sorted(HUMAN_INBOX_PATH.glob("*.md")):
-            try:
-                text = p.read_text(encoding="utf-8").strip()
-                if text:
-                    inbox_items.append({"filename": p.name, "content": text})
-            except Exception as e:
-                print(f"[inbox] failed to read {p.name}: {e}")
-
+    inbox_items = check_human_inbox()
     if inbox_items:
         pick = random.choice(inbox_items)
         print(f"[inbox] found {len(inbox_items)} request(s); using '{pick['filename']}'")
