@@ -345,6 +345,11 @@ def already_replied_to_comment(state: Dict[str, Any], comment_id: str) -> bool:
     return _already_recent_id(state, "recent_replied_comment_ids", comment_id)
 
 
+def remember_replied_and_save(state: Dict[str, Any], post_id: str) -> None:
+    remember_replied(state, post_id)
+    save_state(state)
+
+
 def remember_replied_comment_and_save(state: Dict[str, Any], comment_id: str) -> None:
     remember_replied_comment(state, comment_id)
     save_state(state)
@@ -408,18 +413,21 @@ def validate_outgoing_text(text: str, *, allow_urls: bool = False) -> Tuple[bool
     return True, "ok"
 
 
-def clamp_text(text: str, max_chars: int) -> str:
-    t = (text or "").strip()
+def clamp_text(
+    text: str,
+    max_chars: int,
+    *,
+    replace_newlines: bool = False,
+    add_ellipsis: bool = True,
+) -> str:
+    t = (text or "")
+    if replace_newlines:
+        t = t.replace("\n", " ")
+    t = t.strip()
     if len(t) <= max_chars:
         return t
-    return t[:max_chars].rsplit(" ", 1)[0] + "…"
-
-
-def clamp_title(title: str) -> str:
-    t = (title or "").replace("\n", " ").strip()
-    if len(t) <= MAX_TITLE_CHARS:
-        return t
-    return t[:MAX_TITLE_CHARS].rsplit(" ", 1)[0]
+    trimmed = t[:max_chars].rsplit(" ", 1)[0]
+    return (trimmed + "…") if add_ellipsis else trimmed
 
 
 # ----------------------------
@@ -1196,14 +1204,12 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
                                 f"[DRY RUN] Would COMMENT (mode={mode['name']}, post_id={post_id})",
                                 comment,
                             )
-                            remember_replied(state, post_id)
-                            save_state(state)
+                            remember_replied_and_save(state, post_id)
                         else:
                             print(f"[moltbook] ({mode['name']}) comment on {post_id}: {comment}")
                             try:
                                 comment_on_post(creds.api_key, post_id, comment)  # type: ignore[union-attr]
-                                remember_replied(state, post_id)
-                                save_state(state)
+                                remember_replied_and_save(state, post_id)
                             except Exception as e:
                                 print(f"[moltbook] comment error: {e}")
                                 if "401" in str(e) or "Authentication" in str(e):
@@ -1219,7 +1225,12 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
 
                 try:
                     payload = _extract_json_from_llm(raw)
-                    title = clamp_title(str(payload.get("title", "")))
+                    title = clamp_text(
+                        str(payload.get("title", "")),
+                        MAX_TITLE_CHARS,
+                        replace_newlines=True,
+                        add_ellipsis=False,
+                    )
                     content = clamp_text(str(payload.get("content", "")), MAX_POST_CHARS)
 
                     ok_t, why_t = validate_outgoing_text(title, allow_urls=False)
