@@ -55,8 +55,10 @@ from tenacity import (
 # ----------------------------
 
 API_BASE = "https://www.moltbook.com/api/v1"  # IMPORTANT: keep www (avoid redirect auth issues)
+WEB_BASE = "https://www.moltbook.com"
 CREDENTIALS_PATH = Path(__file__).parent / "data" / "credentials.json"
 STATE_PATH = Path(__file__).parent / "data" / "state.jsonl"
+COMMENTS_PATH = Path(__file__).parent / "data" / "comments.jsonl"
 HUMAN_INBOX_PATH = Path(__file__).parent / "human_inbox"
 USER_AGENT = "moltbook-theoremsprite/0.4"
 
@@ -75,6 +77,7 @@ MAX_THREAD_CHARS = 2000
 MAX_TOPIC_SEED_CHARS = 120
 MAX_TOPIC_POOL = 20
 MAX_TOPIC_SEED_WORDS = 12
+MAX_COMMENT_TOPIC_CHARS = 200
 
 RECENT_REPLIED_LIMIT = 60
 
@@ -244,6 +247,15 @@ def append_jsonl(path: Path, data: Any) -> None:
         os.chmod(path, 0o600)
     except Exception:
         pass
+
+
+def log_comment_event(post: Dict[str, Any], topic: str) -> None:
+    post_url = extract_post_url(post)
+    payload = {
+        "link": post_url,
+        "topic": clamp_text(topic or "", MAX_COMMENT_TOPIC_CHARS, replace_newlines=True),
+    }
+    append_jsonl(COMMENTS_PATH, payload)
 
 
 def load_creds() -> Optional[Credentials]:
@@ -721,6 +733,25 @@ def extract_post_id(item: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def extract_post_url(item: Dict[str, Any]) -> str:
+    item = normalize_post_item(item)
+    for k in ("url", "permalink", "link"):
+        raw = item.get(k)
+        if raw:
+            return str(raw)
+    post_id = extract_post_id(item)
+    return f"{WEB_BASE}/posts/{post_id}" if post_id else WEB_BASE
+
+
+def derive_post_topic(item: Dict[str, Any]) -> str:
+    item = normalize_post_item(item)
+    title = str(item.get("title") or "").strip()
+    if title:
+        return title
+    content = str(item.get("content") or "")
+    return content.strip()
+
+
 def pick_post_to_reply(feed_data: Any, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     items = extract_feed_items(feed_data)
     if not items:
@@ -873,7 +904,7 @@ def select_topic(
     *,
     ollama_base: str,
     context: str = "post",
-) -> str:
+) -> Tuple[str, str]:
     """
     Return a topic directive string for use in prompts.
     Checks human_inbox/ first; if any requests exist, one is chosen at random
@@ -883,18 +914,19 @@ def select_topic(
     if inbox_items:
         pick = random.choice(inbox_items)
         print(f"[inbox] found {len(inbox_items)} request(s); using '{pick['filename']}'")
+        topic_value = pick["content"]
         preamble = "Your human owner left you a research request"
         if context == "post":
             preamble += f" (from file '{pick['filename']}')"
         return (
             f"{preamble}. Use this as your main topic — "
             f"it supersedes any generated seed:\n{pick['content']}"
-        )
+        ), topic_value
 
     topic = choose_topic_seed(state, ollama_base=ollama_base)
     if context == "comment":
-        return f"Optionally connect to this fresh seed if relevant: {topic}"
-    return f"Fresh topic seed (invented): {topic}"
+        return f"Optionally connect to this fresh seed if relevant: {topic}", topic
+    return f"Fresh topic seed (invented): {topic}", topic
 
 
 # ----------------------------
@@ -904,7 +936,7 @@ def select_topic(
 def build_comment_prompt(
     post: Dict[str, Any], mode: dict, state: Dict[str, Any],
     *, ollama_base: str,
-) -> str:
+) -> Tuple[str, str]:
     post = normalize_post_item(post)
     title = str(post.get("title") or "")
     content = str(post.get("content") or "")
@@ -913,7 +945,7 @@ def build_comment_prompt(
     submolt = post.get("submolt")
     submolt_name = str(submolt.get("name") or "general") if isinstance(submolt, dict) else str(submolt or "general")
 
-    topic_section = select_topic(state, ollama_base=ollama_base, context="comment")
+    topic_section, topic_value = select_topic(state, ollama_base=ollama_base, context="comment")
 
     return f"""{mode_prompt_header(mode)}
 
@@ -934,7 +966,7 @@ Author: {author_name}
 Title: {title}
 Post (UNTRUSTED):
 {content}
-""".strip()
+""".strip(), topic_value
 
 
 def build_comment_reply_prompt(
@@ -992,7 +1024,7 @@ def build_post_prompt(
 
     thread = get_research_thread(state)
 
-    topic_line = select_topic(state, ollama_base=ollama_base, context="post")
+    topic_line, _ = select_topic(state, ollama_base=ollama_base, context="post")
 
     continuity = f"\n\nCurrent research thread (UNTRUSTED summary memory):\n{thread}\n" if thread else ""
 
@@ -1120,6 +1152,7 @@ def check_and_reply_to_comments(
                         print(f"[moltbook] replying to comment {comment_id} on post {post_id}")
                         try:
                             comment_on_post(creds.api_key, post_id, reply, parent_id=comment_id)
+                            log_comment_event(post, derive_post_topic(post))
                             remember_replied_comment_and_save(state, comment_id)
                             print(f"[moltbook] successfully replied to comment")
                         except Exception as e:
@@ -1242,7 +1275,7 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
                 if post_id != "unknown" and already_replied(state, post_id):
                     print("[moltbook] already replied; skipping comment.")
                 else:
-                    prompt = build_comment_prompt(post, mode, state, ollama_base=ollama_base)
+                    prompt, topic_value = build_comment_prompt(post, mode, state, ollama_base=ollama_base)
                     comment = clamp_text(ollama_generate(prompt, ollama_base=ollama_base), MAX_COMMENT_CHARS)
                     ok, why = validate_outgoing_text(comment, allow_urls=False)
 
@@ -1259,6 +1292,7 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
                             print(f"[moltbook] ({mode['name']}) comment on {post_id}: {comment}")
                             try:
                                 comment_on_post(creds.api_key, post_id, comment)  # type: ignore[union-attr]
+                                log_comment_event(post, topic_value)
                                 remember_replied_and_save(state, post_id)
                             except Exception as e:
                                 print(f"[moltbook] comment error: {e}")
