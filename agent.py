@@ -853,44 +853,40 @@ Optional context (untrusted):
 # Human inbox + unified topic selection
 # ----------------------------
 
-def check_human_inbox() -> List[Dict[str, str]]:
-    """
-    Scan HUMAN_INBOX_PATH for markdown files.
-    Returns a list of dicts with keys 'filename' and 'content' for each .md file found.
-    """
-    if not HUMAN_INBOX_PATH.is_dir():
-        return []
-    items: List[Dict[str, str]] = []
-    for p in sorted(HUMAN_INBOX_PATH.glob("*.md")):
-        try:
-            text = p.read_text(encoding="utf-8").strip()
-            if text:
-                items.append({"filename": p.name, "content": text})
-        except Exception as e:
-            print(f"[inbox] failed to read {p.name}: {e}")
-    return items
-
-
 def select_topic(
     state: Dict[str, Any],
-    inbox_topic: Optional[Dict[str, str]],
     *,
     ollama_base: str,
     context: str = "post",
 ) -> str:
     """
     Return a topic directive string for use in prompts.
-    If inbox_topic is set, it supersedes the built-in topic pool.
+    Checks human_inbox/ for markdown files first; if any exist, one is
+    chosen at random and supersedes the built-in topic pool.
     context should be 'post' or 'comment' to adjust phrasing.
     """
-    if inbox_topic:
+    # Check human inbox
+    inbox_items: List[Dict[str, str]] = []
+    if HUMAN_INBOX_PATH.is_dir():
+        for p in sorted(HUMAN_INBOX_PATH.glob("*.md")):
+            try:
+                text = p.read_text(encoding="utf-8").strip()
+                if text:
+                    inbox_items.append({"filename": p.name, "content": text})
+            except Exception as e:
+                print(f"[inbox] failed to read {p.name}: {e}")
+
+    if inbox_items:
+        pick = random.choice(inbox_items)
+        print(f"[inbox] found {len(inbox_items)} request(s); using '{pick['filename']}'")
         preamble = "Your human owner left you a research request"
         if context == "post":
-            preamble += f" (from file '{inbox_topic['filename']}')"
+            preamble += f" (from file '{pick['filename']}')"
         return (
             f"{preamble}. Use this as your main topic — "
-            f"it supersedes any generated seed:\n{inbox_topic['content']}"
+            f"it supersedes any generated seed:\n{pick['content']}"
         )
+
     topic = choose_topic_seed(state, ollama_base=ollama_base)
     if context == "comment":
         return f"Optionally connect to this fresh seed if relevant: {topic}"
@@ -903,7 +899,7 @@ def select_topic(
 
 def build_comment_prompt(
     post: Dict[str, Any], mode: dict, state: Dict[str, Any],
-    *, ollama_base: str, inbox_topic: Optional[Dict[str, str]] = None,
+    *, ollama_base: str,
 ) -> str:
     post = normalize_post_item(post)
     title = str(post.get("title") or "")
@@ -913,7 +909,7 @@ def build_comment_prompt(
     submolt = post.get("submolt")
     submolt_name = str(submolt.get("name") or "general") if isinstance(submolt, dict) else str(submolt or "general")
 
-    topic_section = select_topic(state, inbox_topic, ollama_base=ollama_base, context="comment")
+    topic_section = select_topic(state, ollama_base=ollama_base, context="comment")
 
     return f"""{mode_prompt_header(mode)}
 
@@ -981,7 +977,7 @@ Author: {commenter_name}
 
 def build_post_prompt(
     mode: dict, state: Dict[str, Any],
-    *, ollama_base: str, inbox_topic: Optional[Dict[str, str]] = None,
+    *, ollama_base: str,
 ) -> str:
     post_type = weighted_choice(mode["post_type_weights"])
     post_type_desc = {
@@ -993,7 +989,7 @@ def build_post_prompt(
 
     thread = get_research_thread(state)
 
-    topic_line = select_topic(state, inbox_topic, ollama_base=ollama_base, context="post")
+    topic_line = select_topic(state, ollama_base=ollama_base, context="post")
 
     continuity = f"\n\nCurrent research thread (UNTRUSTED summary memory):\n{thread}\n" if thread else ""
 
@@ -1208,14 +1204,6 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
     while True:
         state["lastMoltbookCheck"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-        # Check human inbox for topic requests (supersedes built-in topics)
-        inbox_items = check_human_inbox()
-        inbox_topic = random.choice(inbox_items) if inbox_items else None
-        if inbox_topic:
-            print(f"[inbox] found {len(inbox_items)} request(s); selected '{inbox_topic['filename']}' as topic")
-        else:
-            print("[inbox] no requests in human_inbox (using generated topics)")
-
         update_topic_pool(state, ollama_base=ollama_base)
 
         mode = choose_mode()
@@ -1256,7 +1244,7 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
                 if post_id != "unknown" and already_replied(state, post_id):
                     print("[moltbook] already replied; skipping comment.")
                 else:
-                    prompt = build_comment_prompt(post, mode, state, ollama_base=ollama_base, inbox_topic=inbox_topic)
+                    prompt = build_comment_prompt(post, mode, state, ollama_base=ollama_base)
                     comment = clamp_text(ollama_generate(prompt, ollama_base=ollama_base), MAX_COMMENT_CHARS)
                     ok, why = validate_outgoing_text(comment, allow_urls=False)
 
@@ -1284,7 +1272,7 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
 
         elif action == "post_one":
             if should_post_now(state) and random.random() < 0.30:
-                prompt = build_post_prompt(mode, state, ollama_base=ollama_base, inbox_topic=inbox_topic)
+                prompt = build_post_prompt(mode, state, ollama_base=ollama_base)
                 raw = ollama_generate(prompt, ollama_base=ollama_base)
 
                 try:
