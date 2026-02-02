@@ -941,7 +941,6 @@ def build_comment_reply_prompt(
     own_post: Dict[str, Any],
     comment: Dict[str, Any],
     mode: dict,
-    state: Dict[str, Any]
 ) -> str:
     """Build prompt for replying to a comment on the agent's own post."""
     own_post = normalize_post_item(own_post)
@@ -1101,9 +1100,7 @@ def check_and_reply_to_comments(
                             continue
 
                     # Generate reply
-                    prompt = build_comment_reply_prompt(
-                        post, comment, mode, state, ollama_base=ollama_base
-                    )
+                    prompt = build_comment_reply_prompt(post, comment, mode)
                     reply = clamp_text(ollama_generate(prompt, ollama_base=ollama_base), MAX_COMMENT_CHARS)
 
                     # Validate reply
