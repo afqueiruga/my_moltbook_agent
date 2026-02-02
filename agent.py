@@ -850,7 +850,7 @@ Optional context (untrusted):
 
 
 # ----------------------------
-# Human inbox
+# Human inbox + unified topic selection
 # ----------------------------
 
 def check_human_inbox() -> List[Dict[str, str]]:
@@ -871,11 +871,30 @@ def check_human_inbox() -> List[Dict[str, str]]:
     return items
 
 
-def pick_inbox_topic(inbox_items: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
-    """Pick one inbox item at random to use as the topic for this heartbeat."""
-    if not inbox_items:
-        return None
-    return random.choice(inbox_items)
+def select_topic(
+    state: Dict[str, Any],
+    inbox_topic: Optional[Dict[str, str]],
+    *,
+    ollama_base: str,
+    context: str = "post",
+) -> str:
+    """
+    Return a topic directive string for use in prompts.
+    If inbox_topic is set, it supersedes the built-in topic pool.
+    context should be 'post' or 'comment' to adjust phrasing.
+    """
+    if inbox_topic:
+        preamble = "Your human owner left you a research request"
+        if context == "post":
+            preamble += f" (from file '{inbox_topic['filename']}')"
+        return (
+            f"{preamble}. Use this as your main topic — "
+            f"it supersedes any generated seed:\n{inbox_topic['content']}"
+        )
+    topic = choose_topic_seed(state, ollama_base=ollama_base)
+    if context == "comment":
+        return f"Optionally connect to this fresh seed if relevant: {topic}"
+    return f"Fresh topic seed (invented): {topic}"
 
 
 # ----------------------------
@@ -894,14 +913,7 @@ def build_comment_prompt(
     submolt = post.get("submolt")
     submolt_name = str(submolt.get("name") or "general") if isinstance(submolt, dict) else str(submolt or "general")
 
-    if inbox_topic:
-        topic_section = (
-            f"Your human owner left you a research request. "
-            f"Prioritize connecting your comment to this topic:\n{inbox_topic['content']}"
-        )
-    else:
-        topic = choose_topic_seed(state, ollama_base=ollama_base)
-        topic_section = f"Optionally connect to this fresh seed if relevant: {topic}"
+    topic_section = select_topic(state, inbox_topic, ollama_base=ollama_base, context="comment")
 
     return f"""{mode_prompt_header(mode)}
 
@@ -981,14 +993,7 @@ def build_post_prompt(
 
     thread = get_research_thread(state)
 
-    if inbox_topic:
-        topic_line = (
-            f"Your human owner left you a research request (from file '{inbox_topic['filename']}').\n"
-            f"Use this as your main topic — it supersedes any generated seed:\n{inbox_topic['content']}"
-        )
-    else:
-        topic = choose_topic_seed(state, ollama_base=ollama_base)
-        topic_line = f"Fresh topic seed (invented): {topic}"
+    topic_line = select_topic(state, inbox_topic, ollama_base=ollama_base, context="post")
 
     continuity = f"\n\nCurrent research thread (UNTRUSTED summary memory):\n{thread}\n" if thread else ""
 
@@ -1203,9 +1208,9 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
     while True:
         state["lastMoltbookCheck"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-        # Check human inbox for topic requests
+        # Check human inbox for topic requests (supersedes built-in topics)
         inbox_items = check_human_inbox()
-        inbox_topic = pick_inbox_topic(inbox_items)
+        inbox_topic = random.choice(inbox_items) if inbox_items else None
         if inbox_topic:
             print(f"[inbox] found {len(inbox_items)} request(s); selected '{inbox_topic['filename']}' as topic")
         else:
