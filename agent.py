@@ -57,6 +57,7 @@ from tenacity import (
 API_BASE = "https://www.moltbook.com/api/v1"  # IMPORTANT: keep www (avoid redirect auth issues)
 CREDENTIALS_PATH = Path(__file__).parent / "data" / "credentials.json"
 STATE_PATH = Path(__file__).parent / "data" / "state.jsonl"
+HUMAN_INBOX_PATH = Path(__file__).parent / "human_inbox"
 USER_AGENT = "moltbook-theoremsprite/0.4"
 
 OLLAMA_BASE_DEFAULT = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -849,10 +850,61 @@ Optional context (untrusted):
 
 
 # ----------------------------
+# Human inbox + unified topic selection
+# ----------------------------
+
+def check_human_inbox() -> List[Dict[str, str]]:
+    """Return list of {'filename', 'content'} for each .md file in human_inbox/."""
+    if not HUMAN_INBOX_PATH.is_dir():
+        return []
+    items: List[Dict[str, str]] = []
+    for p in sorted(HUMAN_INBOX_PATH.glob("*.md")):
+        try:
+            text = p.read_text(encoding="utf-8").strip()
+            if text:
+                items.append({"filename": p.name, "content": text})
+        except Exception as e:
+            print(f"[inbox] failed to read {p.name}: {e}")
+    return items
+
+
+def select_topic(
+    state: Dict[str, Any],
+    *,
+    ollama_base: str,
+    context: str = "post",
+) -> str:
+    """
+    Return a topic directive string for use in prompts.
+    Checks human_inbox/ first; if any requests exist, one is chosen at random
+    and supersedes the built-in topic pool.
+    """
+    inbox_items = check_human_inbox()
+    if inbox_items:
+        pick = random.choice(inbox_items)
+        print(f"[inbox] found {len(inbox_items)} request(s); using '{pick['filename']}'")
+        preamble = "Your human owner left you a research request"
+        if context == "post":
+            preamble += f" (from file '{pick['filename']}')"
+        return (
+            f"{preamble}. Use this as your main topic — "
+            f"it supersedes any generated seed:\n{pick['content']}"
+        )
+
+    topic = choose_topic_seed(state, ollama_base=ollama_base)
+    if context == "comment":
+        return f"Optionally connect to this fresh seed if relevant: {topic}"
+    return f"Fresh topic seed (invented): {topic}"
+
+
+# ----------------------------
 # Prompt builders (mode-aware, injection-hardened)
 # ----------------------------
 
-def build_comment_prompt(post: Dict[str, Any], mode: dict, state: Dict[str, Any], *, ollama_base: str) -> str:
+def build_comment_prompt(
+    post: Dict[str, Any], mode: dict, state: Dict[str, Any],
+    *, ollama_base: str,
+) -> str:
     post = normalize_post_item(post)
     title = str(post.get("title") or "")
     content = str(post.get("content") or "")
@@ -861,7 +913,7 @@ def build_comment_prompt(post: Dict[str, Any], mode: dict, state: Dict[str, Any]
     submolt = post.get("submolt")
     submolt_name = str(submolt.get("name") or "general") if isinstance(submolt, dict) else str(submolt or "general")
 
-    topic = choose_topic_seed(state, ollama_base=ollama_base)
+    topic_section = select_topic(state, ollama_base=ollama_base, context="comment")
 
     return f"""{mode_prompt_header(mode)}
 
@@ -872,7 +924,7 @@ Comment style for this mode: {mode["comment_style"]}
 Write 1-3 sentences max.
 If the post is ML theory:
 - either ask for assumptions/definitions, propose a lemma/proof idea, or propose a counterexample test.
-Optionally connect to this fresh seed if relevant: {topic}
+{topic_section}
 If unrelated:
 - respond politely with a single question that steers toward ML theory.
 
@@ -927,7 +979,10 @@ Author: {commenter_name}
 """.strip()
 
 
-def build_post_prompt(mode: dict, state: Dict[str, Any], *, ollama_base: str) -> str:
+def build_post_prompt(
+    mode: dict, state: Dict[str, Any],
+    *, ollama_base: str,
+) -> str:
     post_type = weighted_choice(mode["post_type_weights"])
     post_type_desc = {
         "A": "Conjecture + sanity checks requested",
@@ -937,7 +992,8 @@ def build_post_prompt(mode: dict, state: Dict[str, Any], *, ollama_base: str) ->
     }[post_type]
 
     thread = get_research_thread(state)
-    topic = choose_topic_seed(state, ollama_base=ollama_base)
+
+    topic_line = select_topic(state, ollama_base=ollama_base, context="post")
 
     continuity = f"\n\nCurrent research thread (UNTRUSTED summary memory):\n{thread}\n" if thread else ""
 
@@ -945,7 +1001,7 @@ def build_post_prompt(mode: dict, state: Dict[str, Any], *, ollama_base: str) ->
 
 TASK:
 Write ONE Moltbook post for submolt 'general' about machine learning theory.
-Fresh topic seed (invented): {topic}
+{topic_line}
 Chosen post type: {post_type_desc}
 
 Hard constraints:
