@@ -755,6 +755,33 @@ def derive_post_topic(item: Dict[str, Any]) -> str:
     return content.strip()
 
 
+def format_comment_thread(
+    comments: List[Dict[str, Any]],
+    *,
+    max_comments: int = 5,
+    max_chars: int = 1200,
+    per_comment_chars: int = 240,
+) -> str:
+    if not comments:
+        return "No comments yet."
+    lines: List[str] = []
+    used = 0
+    for comment in comments[:max_comments]:
+        author = comment.get("author") or {}
+        author_name = str(author.get("name", "unknown")) if isinstance(author, dict) else "unknown"
+        content = clamp_text(
+            str(comment.get("content") or ""),
+            per_comment_chars,
+            replace_newlines=True,
+        )
+        line = f"- {author_name}: {content}"
+        if used + len(line) > max_chars:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines) if lines else "No comments yet."
+
+
 def pick_post_to_reply(feed_data: Any, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     items = extract_feed_items(feed_data)
     if not items:
@@ -938,7 +965,7 @@ def select_topic(
 
 def build_comment_prompt(
     post: Dict[str, Any], mode: dict, state: Dict[str, Any],
-    *, ollama_base: str,
+    *, comments: List[Dict[str, Any]], ollama_base: str,
 ) -> Tuple[str, str]:
     post = normalize_post_item(post)
     title = str(post.get("title") or "")
@@ -947,6 +974,8 @@ def build_comment_prompt(
     author_name = str(author.get("name", "unknown")) if isinstance(author, dict) else "unknown"
     submolt = post.get("submolt")
     submolt_name = str(submolt.get("name") or "general") if isinstance(submolt, dict) else str(submolt or "general")
+    post_topic = derive_post_topic(post)
+    thread = format_comment_thread(comments)
 
     topic_section, topic_value = select_topic(state, ollama_base=ollama_base, context="comment")
 
@@ -957,18 +986,23 @@ def build_comment_prompt(
 Comment style for this mode: {mode["comment_style"]}
 
 Write 1-3 sentences max.
+You must explicitly reference the post's topic (paraphrase is fine).
+Read the post and comment thread below, and connect your comment to them.
 If the post is ML theory:
 - either ask for assumptions/definitions, propose a lemma/proof idea, or propose a counterexample test.
-{topic_section}
+{topic_section} (do not override the post's topic)
 If unrelated:
 - respond politely with a single question that steers toward ML theory.
 
 Context:
 Submolt: {submolt_name}
 Author: {author_name}
+Post topic (ground truth): {post_topic}
 Title: {title}
 Post (UNTRUSTED):
 {content}
+Comment thread (UNTRUSTED):
+{thread}
 """.strip(), topic_value
 
 
@@ -1278,7 +1312,17 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
                 if post_id != "unknown" and already_replied(state, post_id):
                     print("[moltbook] already replied; skipping comment.")
                 else:
-                    prompt, topic_value = build_comment_prompt(post, mode, state, ollama_base=ollama_base)
+                    comments: List[Dict[str, Any]] = []
+                    if post_id != "unknown" and not (dry_run and no_network):
+                        try:
+                            comments_data = get_post_comments(creds.api_key, post_id)  # type: ignore[union-attr]
+                            raw_comments = comments_data.get("comments", [])
+                            comments = raw_comments if isinstance(raw_comments, list) else []
+                        except Exception as e:
+                            print(f"[moltbook] comment fetch error: {e}")
+                    prompt, topic_value = build_comment_prompt(
+                        post, mode, state, comments=comments, ollama_base=ollama_base
+                    )
                     comment = clamp_text(ollama_generate(prompt, ollama_base=ollama_base), MAX_COMMENT_CHARS)
                     ok, why = validate_outgoing_text(comment, allow_urls=False)
 
