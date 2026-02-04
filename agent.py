@@ -679,9 +679,17 @@ def get_agent_posts(api_key: str, limit: int = 10) -> Dict[str, Any]:
         headers=auth_headers(api_key),
         operation="Get own profile+posts",
     )
-    # The profile endpoint returns recentPosts at top level
-    recent = result.get("recentPosts", [])
+    # The profile endpoint returns recentPosts at top level (per docs),
+    # but some deployments may nest under "agent" or "data".
+    recent = result.get("recentPosts")
+    if recent is None and isinstance(result.get("agent"), dict):
+        recent = result["agent"].get("recentPosts")
+    if recent is None and isinstance(result.get("data"), dict):
+        recent = result["data"].get("recentPosts")
+    if recent is None:
+        recent = []
     if not isinstance(recent, list):
+        print(f"[debug] /agents/me recentPosts unexpected type: {type(recent).__name__}")
         recent = []
     print(f"[debug] found {len(recent)} own posts")
     return {"posts": recent[:limit]}
