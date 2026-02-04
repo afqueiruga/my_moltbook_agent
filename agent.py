@@ -36,6 +36,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -280,6 +281,7 @@ def save_creds(creds: Credentials) -> None:
 DEFAULT_STATE: Dict[str, Any] = {
     "lastMoltbookCheck": None,
     "last_post_time": None,
+    "last_comment_reply_time": None,
     "current_thread": "",
     "topic_pool": [],
     "recent_replied_post_ids": [],
@@ -685,11 +687,12 @@ def get_agent_posts(api_key: str, limit: int = 10) -> Dict[str, Any]:
     return {"posts": recent[:limit]}
 
 
-def get_post_comments(api_key: str, post_id: str) -> Dict[str, Any]:
+def get_post_comments(api_key: str, post_id: str, *, sort: str = "new") -> Dict[str, Any]:
     """Get comments on a specific post."""
     print(f"[debug] fetching comments for post {post_id}...")
     result = moltbook_request(
         "GET", f"{API_BASE}/posts/{post_id}/comments",
+        params={"sort": sort},
         headers=auth_headers(api_key),
         operation=f"Get comments for post {post_id}",
     )
@@ -753,6 +756,35 @@ def derive_post_topic(item: Dict[str, Any]) -> str:
         return title
     content = str(item.get("content") or "")
     return content.strip()
+
+
+def _parse_comment_timestamp(comment: Dict[str, Any]) -> Optional[float]:
+    raw = None
+    for key in ("created_at", "createdAt", "timestamp", "created", "time"):
+        if key in comment:
+            raw = comment.get(key)
+            break
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        ts = float(raw)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return ts
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 def format_comment_thread(
@@ -1140,13 +1172,23 @@ def check_and_reply_to_comments(
             print("[moltbook] no own posts found")
             return
 
+        last_reply_time = state.get("last_comment_reply_time")
+        if last_reply_time is None:
+            last_reply_time = 0.0
+        else:
+            last_reply_time = float(last_reply_time)
+
+        candidate_post: Optional[Dict[str, Any]] = None
+        candidate_comment: Optional[Dict[str, Any]] = None
+        candidate_ts = -1.0
+
         for post in own_posts:
             post_id = extract_post_id(post)
             if not post_id:
                 continue
 
             try:
-                comments_data = get_post_comments(creds.api_key, post_id)
+                comments_data = get_post_comments(creds.api_key, post_id, sort="new")
                 comments = comments_data.get("comments", [])
 
                 if not isinstance(comments, list):
@@ -1157,47 +1199,64 @@ def check_and_reply_to_comments(
                     if not comment_id:
                         continue
 
-                    # Skip if we already replied to this comment
                     if already_replied_to_comment(state, comment_id):
                         continue
 
-                    # Skip if comment is by the agent itself (avoid replying to self)
                     comment_author = comment.get("author", {})
                     if isinstance(comment_author, dict):
                         author_name = str(comment_author.get("name", ""))
                         if author_name == creds.agent_name:
                             continue
 
-                    # Generate reply
-                    prompt = build_comment_reply_prompt(post, comment, mode)
-                    reply = clamp_text(ollama_generate(prompt, ollama_base=ollama_base), MAX_COMMENT_CHARS)
-
-                    # Validate reply
-                    ok, why = validate_outgoing_text(reply, allow_urls=False)
-                    if not ok:
-                        print(f"[guard] refusing to reply to comment ({why})")
+                    ts = _parse_comment_timestamp(comment)
+                    if last_reply_time > 0 and ts is None:
+                        continue
+                    if ts is not None and ts <= last_reply_time:
                         continue
 
-                    # Post reply
-                    if dry_run:
-                        dry_print_block(
-                            f"[DRY RUN] Would REPLY to comment {comment_id} on post {post_id}",
-                            reply,
-                        )
-                        remember_replied_comment_and_save(state, comment_id)
-                    else:
-                        print(f"[moltbook] replying to comment {comment_id} on post {post_id}")
-                        try:
-                            comment_on_post(creds.api_key, post_id, reply, parent_id=comment_id)
-                            log_comment_event(post, derive_post_topic(post))
-                            remember_replied_comment_and_save(state, comment_id)
-                            print(f"[moltbook] successfully replied to comment")
-                        except Exception as e:
-                            print(f"[moltbook] comment reply error: {e}")
+                    if ts is None:
+                        ts = 0.0
+                    if ts > candidate_ts:
+                        candidate_ts = ts
+                        candidate_post = post
+                        candidate_comment = comment
 
             except Exception as e:
                 print(f"[moltbook] error checking comments for post {post_id}: {e}")
                 continue
+
+        if not candidate_post or not candidate_comment:
+            return
+
+        post_id = extract_post_id(candidate_post)
+        comment_id = str(candidate_comment.get("id", ""))
+        if not post_id or not comment_id:
+            return
+
+        prompt = build_comment_reply_prompt(candidate_post, candidate_comment, mode)
+        reply = clamp_text(ollama_generate(prompt, ollama_base=ollama_base), MAX_COMMENT_CHARS)
+
+        ok, why = validate_outgoing_text(reply, allow_urls=False)
+        if not ok:
+            print(f"[guard] refusing to reply to comment ({why})")
+            return
+
+        state["last_comment_reply_time"] = time.time()
+        if dry_run:
+            dry_print_block(
+                f"[DRY RUN] Would REPLY to comment {comment_id} on post {post_id}",
+                reply,
+            )
+            remember_replied_comment_and_save(state, comment_id)
+        else:
+            print(f"[moltbook] replying to comment {comment_id} on post {post_id}")
+            try:
+                comment_on_post(creds.api_key, post_id, reply, parent_id=comment_id)
+                log_comment_event(candidate_post, derive_post_topic(candidate_post))
+                remember_replied_comment_and_save(state, comment_id)
+                print(f"[moltbook] successfully replied to comment")
+            except Exception as e:
+                print(f"[moltbook] comment reply error: {e}")
 
     except Exception as e:
         print(f"[moltbook] error checking own posts for comments: {e}")
