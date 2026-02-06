@@ -26,6 +26,8 @@ Usage:
   python agent.py run
   python agent.py run --dry-run
   python agent.py run --dry-run --no-network
+  python agent.py run --submolt m/ai
+  python agent.py search --q "training dynamics of linear models" --submolt m/ai --limit 10
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from api_helpers import (
     get_agent_posts,
     get_personal_feed,
     get_post_comments,
+    semantic_search,
     sleep_with_jitter,
 )
 from registration import get_claim_status, parse_register_response, register_agent
@@ -64,6 +67,10 @@ CREDENTIALS_PATH = Path(__file__).parent / "data" / "credentials.json"
 STATE_PATH = Path(__file__).parent / "data" / "state.jsonl"
 COMMENTS_PATH = Path(__file__).parent / "data" / "comments.jsonl"
 HUMAN_INBOX_PATH = Path(__file__).parent / "human_inbox"
+
+# Submolts this agent will post into by default (UI-style names allowed, e.g. "m/ai").
+# Add more entries here to let the agent rotate where it posts.
+SUBMOLTS: List[str] = ["m/ai"]
 
 OLLAMA_BASE_DEFAULT = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
@@ -854,6 +861,7 @@ Author: {commenter_name}
 def build_post_prompt(
     mode: dict, state: Dict[str, Any],
     *, ollama_base: str,
+    submolt: str,
 ) -> str:
     post_type = weighted_choice(mode["post_type_weights"])
     post_type_desc = {
@@ -872,7 +880,7 @@ def build_post_prompt(
     return f"""{mode_prompt_header(mode)}
 
 TASK:
-Write ONE Moltbook post for submolt 'general' about machine learning theory.
+Write ONE Moltbook post for submolt '{submolt}' about machine learning theory.
 {topic_line}
 Chosen post type: {post_type_desc}
 
@@ -1076,7 +1084,13 @@ def dry_print_block(title: str, body: str) -> None:
 # Main loop
 # ----------------------------
 
-def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> None:
+def main_loop(
+    *,
+    allow_remote_ollama: bool,
+    dry_run: bool,
+    no_network: bool,
+    post_submolt_override: Optional[str] = None,
+) -> None:
     creds = load_creds()
 
     # In dry-run + no-network, allow running without creds (no Moltbook calls).
@@ -1182,7 +1196,11 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
 
         elif action == "post_one":
             if should_post_now(state) and random.random() < 0.30:
-                prompt = build_post_prompt(mode, state, ollama_base=ollama_base)
+                if post_submolt_override:
+                    target_submolt = str(post_submolt_override)
+                else:
+                    target_submolt = random.choice(SUBMOLTS) if SUBMOLTS else "general"
+                prompt = build_post_prompt(mode, state, ollama_base=ollama_base, submolt=target_submolt)
                 raw = ollama_generate(prompt, ollama_base=ollama_base)
 
                 try:
@@ -1214,7 +1232,7 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
                         else:
                             print(f"[moltbook] ({mode['name']}) creating post: {title}")
                             try:
-                                create_post(creds.api_key, "general", title, content)  # type: ignore[union-attr]
+                                create_post(creds.api_key, target_submolt, title, content)  # type: ignore[union-attr]
                             except Exception as e:
                                 print(f"[moltbook] post error: {e}")
                                 continue
@@ -1259,6 +1277,60 @@ def cli_register(name: str, description: str) -> None:
         print(f"(verification code: {verification_code})\n")
 
 
+def cli_search(q: str, *, submolt: Optional[str], limit: int, type: str) -> None:
+    creds = load_creds()
+    if creds is None:
+        print("No credentials found.")
+        print("Run: python agent.py register --name YourAgentName --description 'what you do'")
+        return
+
+    data = semantic_search(creds.api_key, q, type=type, limit=limit, submolt=submolt)
+    container: Optional[Dict[str, Any]] = None
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        container = data
+    elif isinstance(data, dict) and isinstance(data.get("data"), dict) and isinstance(data["data"].get("results"), list):
+        container = data["data"]
+
+    results = container.get("results", []) if container else []
+    if not isinstance(results, list) or not results:
+        print("[search] no results")
+        return
+
+    print(f"[search] showing {min(len(results), limit)} result(s)")
+    for r in results[:limit]:
+        if not isinstance(r, dict):
+            continue
+        rtype = str(r.get("type") or "")
+        title = str(r.get("title") or "").strip()
+        content = str(r.get("content") or "").strip()
+        sim = r.get("similarity")
+        author = r.get("author") or {}
+        author_name = str(author.get("name", "unknown")) if isinstance(author, dict) else "unknown"
+        sm = r.get("submolt")
+        sm_name = None
+        if isinstance(sm, dict):
+            sm_name = sm.get("name") or sm.get("display_name")
+        elif sm is not None:
+            sm_name = str(sm)
+        link = extract_post_url(r)
+
+        header_bits = []
+        if rtype:
+            header_bits.append(rtype)
+        if sm_name:
+            header_bits.append(f"m/{sm_name}")
+        if sim is not None:
+            try:
+                header_bits.append(f"sim={float(sim):.2f}")
+            except (TypeError, ValueError):
+                pass
+        header = " ".join(header_bits) if header_bits else "result"
+
+        snippet = title if title else clamp_text(content, 140, replace_newlines=True)
+        print(f"- {header} by {author_name}: {snippet}")
+        print(f"  {link}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd")
@@ -1275,10 +1347,21 @@ def main() -> None:
         help="In dry-run, do not call Moltbook at all (uses sample feed).",
     )
     p_run.add_argument(
+        "--submolt",
+        default=None,
+        help="Override the default posting submolt (e.g. m/ai). If omitted, uses SUBMOLTS list in agent.py.",
+    )
+    p_run.add_argument(
         "--allow-remote-ollama",
         action="store_true",
         help="Allow non-local OLLAMA_HOST (unsafe unless intentional).",
     )
+
+    p_search = sub.add_parser("search", help="Semantic search Moltbook")
+    p_search.add_argument("--q", required=True, help="Natural language query")
+    p_search.add_argument("--submolt", default=None, help="Restrict results to a submolt (e.g. m/ai)")
+    p_search.add_argument("--limit", type=int, default=10)
+    p_search.add_argument("--type", default="posts", choices=["posts", "comments", "all"])
 
     args = parser.parse_args()
 
@@ -1291,7 +1374,10 @@ def main() -> None:
             allow_remote_ollama=bool(args.allow_remote_ollama),
             dry_run=bool(args.dry_run),
             no_network=bool(args.no_network),
+            post_submolt_override=(str(args.submolt) if args.submolt else None),
         )
+    elif args.cmd == "search":
+        cli_search(args.q, submolt=args.submolt, limit=int(args.limit), type=str(args.type))
     else:
         parser.print_help()
 

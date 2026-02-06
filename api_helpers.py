@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import random
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from tenacity import RetryCallState, retry, retry_if_result, stop_after_attempt
@@ -25,6 +25,19 @@ BACKOFF_MAX_SECONDS = 120.0
 # ----------------------------
 # HTTP helpers
 # ----------------------------
+
+def normalize_submolt_name(submolt: Optional[str]) -> str:
+    """
+    Normalize a user-facing submolt reference to an API submolt name.
+
+    Moltbook UI/community references are often written like "m/ai", while the API
+    typically expects the bare submolt name (e.g. "ai", "general").
+    """
+    s = str(submolt or "").strip()
+    if s.lower().startswith("m/"):
+        s = s[2:]
+    return s or "general"
+
 
 def auth_headers(api_key: str) -> Dict[str, str]:
     return {
@@ -170,13 +183,94 @@ def get_personal_feed(api_key: str, sort: str = "new", limit: int = 10) -> Dict[
 
 
 def create_post(api_key: str, submolt: str, title: str, content: str) -> Dict[str, Any]:
+    submolt_name = normalize_submolt_name(submolt)
     return moltbook_request(
         "POST", f"{API_BASE}/posts",
         headers=auth_headers(api_key),
-        json_body={"submolt": submolt, "title": title, "content": content},
+        json_body={"submolt": submolt_name, "title": title, "content": content},
         operation="Create post",
     )
 
+
+def semantic_search(
+    api_key: str,
+    q: str,
+    *,
+    type: str = "all",
+    limit: int = 20,
+    submolt: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Semantic search posts/comments.
+
+    Docs: GET /search?q=...&type=posts|comments|all&limit=...
+    This client also supports optional submolt filtering:
+    - First tries sending `submolt=<name>` to the API.
+    - If the API rejects the parameter (HTTP 400), falls back to client-side filtering.
+    """
+    if not q or not str(q).strip():
+        raise ValueError("q must be non-empty")
+
+    submolt_name = normalize_submolt_name(submolt) if submolt else None
+    params: Dict[str, Any] = {"q": str(q), "type": str(type), "limit": int(limit)}
+    if submolt_name:
+        params["submolt"] = submolt_name
+
+    status, data = _request_with_retry(
+        "GET",
+        f"{API_BASE}/search",
+        headers=auth_headers(api_key),
+        params=params,
+    )
+
+    if status < 400:
+        return data
+
+    # Fallback if server doesn't accept submolt param.
+    if submolt_name and status == 400:
+        params.pop("submolt", None)
+        status2, data2 = _request_with_retry(
+            "GET",
+            f"{API_BASE}/search",
+            headers=auth_headers(api_key),
+            params=params,
+        )
+        if status2 >= 400:
+            raise RuntimeError(f"Search failed ({status2}): {data2}")
+
+        # Results may be top-level or nested under "data".
+        container: Optional[Dict[str, Any]] = None
+        if isinstance(data2, dict) and isinstance(data2.get("results"), list):
+            container = data2
+        elif isinstance(data2, dict) and isinstance(data2.get("data"), dict) and isinstance(data2["data"].get("results"), list):
+            container = data2["data"]
+
+        if container is None:
+            return data2
+
+        results = container.get("results")
+        if not isinstance(results, list):
+            return data2
+
+        filtered: List[Dict[str, Any]] = []
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            sm = r.get("submolt")
+            sm_name = None
+            if isinstance(sm, dict):
+                sm_name = sm.get("name")
+            elif sm is not None:
+                sm_name = sm
+            if sm_name is not None and normalize_submolt_name(str(sm_name)) == submolt_name:
+                filtered.append(r)
+
+        container["results"] = filtered
+        container["count"] = len(filtered)
+        container["filtered_by_submolt"] = submolt_name
+        return data2
+
+    raise RuntimeError(f"Search failed ({status}): {data}")
 
 def comment_on_post(api_key: str, post_id: str, content: str, parent_id: Optional[str] = None) -> Dict[str, Any]:
     body: Dict[str, Any] = {"content": content}
