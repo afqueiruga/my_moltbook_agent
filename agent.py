@@ -50,12 +50,11 @@ from api_helpers import (
     comment_on_post,
     create_post,
     get_agent_posts,
-    get_claim_status,
     get_personal_feed,
     get_post_comments,
-    register_agent,
     sleep_with_jitter,
 )
+from registration import get_claim_status, parse_register_response, register_agent
 
 # ----------------------------
 # Config
@@ -1235,35 +1234,6 @@ def main_loop(*, allow_remote_ollama: bool, dry_run: bool, no_network: bool) -> 
         else:
             print(f"[moltbook] sleeping ~{HEARTBEAT_SECONDS/3600:.1f}h")
             sleep_with_jitter(HEARTBEAT_SECONDS)
-
-
-# ----------------------------
-# Registration response parsing
-# ----------------------------
-
-def _deep_get(d: Any, path: List[str]) -> Optional[Any]:
-    cur = d
-    for p in path:
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(p)
-    return cur
-
-
-def parse_register_response(data: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
-    candidates = [
-        (["agent", "api_key"], ["agent", "claim_url"], ["agent", "verification_code"]),
-        (["data", "agent", "api_key"], ["data", "agent", "claim_url"], ["data", "agent", "verification_code"]),
-        (["api_key"], ["claim_url"], ["verification_code"]),
-        (["data", "api_key"], ["data", "claim_url"], ["data", "verification_code"]),
-    ]
-    for kpath, cpath, vpath in candidates:
-        api_key = _deep_get(data, kpath)
-        claim_url = _deep_get(data, cpath)
-        ver_code = _deep_get(data, vpath)
-        if api_key and claim_url:
-            return str(api_key), str(claim_url), (str(ver_code) if ver_code else None)
-    raise RuntimeError(f"Unexpected register response shape: {data}")
 
 
 # ----------------------------

@@ -157,30 +157,6 @@ def moltbook_request(
     return data
 
 
-# ----------------------------
-# Moltbook API (with bounded retries)
-# ----------------------------
-
-def register_agent(name: str, description: str) -> Dict[str, Any]:
-    status, data = request_json(
-        "POST",
-        f"{API_BASE}/agents/register",
-        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
-        json_body={"name": name, "description": description},
-    )
-    if status >= 400:
-        raise RuntimeError(f"Register failed ({status}): {data}")
-    return data
-
-
-def get_claim_status(api_key: str) -> str:
-    status, data = request_json("GET", f"{API_BASE}/agents/status", headers=auth_headers(api_key))
-    print(f"[debug] status check: HTTP {status}, data={data}")
-    if status >= 400:
-        raise RuntimeError(f"Status failed ({status}): {data}")
-    return str(data.get("status", "unknown"))
-
-
 def get_personal_feed(api_key: str, sort: str = "new", limit: int = 10) -> Dict[str, Any]:
     print(f"[debug] fetching feed...")
     result = moltbook_request(
